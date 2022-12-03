@@ -79,7 +79,7 @@ while (true)
 
 
 var req = new DatasetExecuteQueriesRequest() { Queries = new List<DatasetExecuteQueriesQuery>()};
-req.Queries.Add( new DatasetExecuteQueriesQuery() { Query = "evaluate FactInternetSales" });
+req.Queries.Add( new DatasetExecuteQueriesQuery() { Query = "evaluate 'Internet Sales'" });
 
 for (int i = 0; i < 10; i++)
 {

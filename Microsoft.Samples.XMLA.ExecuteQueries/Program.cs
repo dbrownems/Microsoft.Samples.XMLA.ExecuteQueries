@@ -1,9 +1,8 @@
 using Microsoft.AnalysisServices.AdomdClient;
 using Microsoft.PowerBI.Api;
 using Microsoft.PowerBI.Api.Models;
+using System.Text.Encodings.Web;
 using System.Text.Json;
-
-var builder = WebApplication.CreateBuilder(args);
 
 var configBuilder = new ConfigurationBuilder()
                .SetBasePath(Directory.GetCurrentDirectory())
@@ -12,6 +11,22 @@ var configBuilder = new ConfigurationBuilder()
 
 IConfigurationRoot configuration = configBuilder.Build();
 // Add services to the container.
+
+var connectionStringOverride = configuration.GetValue<string>("ConnectionStringOverride");
+
+var workspaces = new List<Workspace>();
+
+configuration.Bind("Workspaces", workspaces);
+
+foreach (var workspace in workspaces)
+{
+    workspace.Initialize();
+}
+
+var workspaceLookup = workspaces.ToDictionary(w => w.Id);
+
+
+var builder = WebApplication.CreateBuilder(args);
 
 var app = builder.Build();
 
@@ -29,14 +44,15 @@ AdomdConnection con = null;
 
 app.MapGet("/HealthProbe", () => "yep");
 
-app.MapPost("/v1.0/myorg/datasets/{datasetId:Guid}/executeQueries", DatasetExecuteQueries);
+app.MapPost("/v1.0/myorg/{workspaceId:Guid}/datasets/{datasetId:Guid}/executeQueries", DatasetExecuteQueries);
 
 app.Run();
 
 
-async Task<IResult> DatasetExecuteQueries(Guid datasetId, IConfiguration config, HttpContext context, CancellationToken cancel)
+async Task<IResult> DatasetExecuteQueries(Guid workspaceId, Guid datasetId, IConfiguration config, HttpContext context, CancellationToken cancel)
 {
-    
+
+
     var ms = new MemoryStream();
     await context.Request.BodyReader.CopyToAsync(ms);
     ms.Position = 0;
@@ -55,39 +71,67 @@ async Task<IResult> DatasetExecuteQueries(Guid datasetId, IConfiguration config,
     }
     var query = request.Queries[0].Query;
 
-    var dataSource = config["XmlaEndpoint"];
-    if (context.Request.Headers.ContainsKey("X-Xmla-Endpoint"))
+    string constr;
+
+    if (!string.IsNullOrEmpty(connectionStringOverride))
     {
-        dataSource = context.Request.Headers["X-Xmla-Endpoint"];
+        constr = connectionStringOverride;
+    }
+    else
+    {
+        if (!workspaceLookup.ContainsKey(workspaceId))
+        {
+            return Results.BadRequest($"Workspace {workspaceId} not found in the server-side configuration");
+        }
+
+        int authHeaderCount = context.Request.Headers.Authorization.Count;
+        if (authHeaderCount != 1)
+        {
+            return Results.Unauthorized();
+        }
+        var authHeader = context.Request.Headers.Authorization[0];
+        if (!authHeader.StartsWith("Bearer "))
+        {
+            return Results.Unauthorized();
+        }
+        var accessToken = authHeader.Substring("Bearer ".Length);
+
+
+        var workspace = workspaceLookup[workspaceId];
+
+
+        string datasetName;
+        if (workspace.DatasetsFromConfig.ContainsKey(datasetId))
+        {
+            datasetName = workspace.DatasetsFromConfig[datasetId].Name;
+        }
+        else
+        {
+            if (!workspace.DatasetsLoadedFromService)
+            {
+                workspace.LoadDatasetsFromService(workspace.XmlaEndpoint, accessToken);
+            }
+            if (workspace.DatasetsFromService.ContainsKey(datasetId))
+            {
+                datasetName = workspace.DatasetsFromService[datasetId].Name;
+            }
+            else
+            {
+                return Results.BadRequest($"Dataset {datasetId} not found in configuration or in DMV.");
+            }
+
+        }
+
+
+        constr = $"Data Source={workspace.XmlaEndpoint};User Id=;Password={accessToken};Catalog={datasetName};";
+
+        if (!string.IsNullOrEmpty(request.ImpersonatedUserName))
+        {
+            constr = constr + $"EffectiveUserName={request.ImpersonatedUserName}";
+        }
     }
 
-    var catalog = config["DatasetName"];
-    if (context.Request.Headers.ContainsKey("X-Dataset-Name"))
-    {
-        catalog = context.Request.Headers["X-Dataset-Name"];
-    }
 
-    if (string.IsNullOrEmpty(catalog))
-    {
-        return Results.BadRequest("Dataset Name must be specified in the server-side config or in the request X-Dataset-Name header");
-    }
-
-    if (string.IsNullOrEmpty(dataSource))
-    {
-        return Results.BadRequest("XMLA Endpoint Uri must be specified in the server-side config or in the request X-Xmla-Endpoint header");
-    }
-
-
-    int authHeaderCount = context.Request.Headers.Authorization.Count;
-    if (authHeaderCount != 1)
-    {
-        return Results.Unauthorized();
-    }
-    var authHeader = context.Request.Headers.Authorization[0];
-    if (!authHeader.StartsWith("Bearer "))
-    {
-        return Results.Unauthorized();
-    }
 
     var gzip = false;
     if (context.Request.Headers.AcceptEncoding.Any(e => e.Equals("gzip", StringComparison.OrdinalIgnoreCase)))
@@ -95,14 +139,6 @@ async Task<IResult> DatasetExecuteQueries(Guid datasetId, IConfiguration config,
         gzip = true;
     }
 
-    var accessToken = authHeader.Substring("Bearer ".Length);
-
-    var constr = $"Data Source={dataSource};User Id=;Password={accessToken};Catalog={catalog};";// Persist Security Info=True; Impersonation Level=Impersonate";
-
-    if (!string.IsNullOrEmpty(request.ImpersonatedUserName))
-    {
-        constr = constr + $"EffectiveUserName={request.ImpersonatedUserName}";
-    }
 
     if (con == null)
     {
@@ -110,14 +146,6 @@ async Task<IResult> DatasetExecuteQueries(Guid datasetId, IConfiguration config,
         con.Open();
     }
     
-    //if (sessionId != null)
-    //    con.SessionID = sessionId;
-    //con.Open();
-
-    //sessionId = con.SessionID;
-
-   
-
     var cmd = con.CreateCommand();
     cmd.CommandText = query;
     var reader = cmd.ExecuteReader();
@@ -126,5 +154,82 @@ async Task<IResult> DatasetExecuteQueries(Guid datasetId, IConfiguration config,
     return result;
 
 
+    
+}
+
+
+
+public class Dataset
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; }
+}
+
+public class Workspace
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; }
+
+    public string XmlaEndpoint { get; set; }
+
+    public List<Dataset> Datasets { get; set; } = new List<Dataset>();
+
+    public Dictionary<Guid, Dataset> DatasetsFromConfig { get; set; } = new Dictionary<Guid, Dataset>();
+    public Dictionary<Guid, Dataset> DatasetsFromService { get; set; } = new Dictionary<Guid, Dataset>();
+
+    public bool DatasetsLoadedFromService { get; set; } = false;
+    public void Initialize()
+    {
+
+        
+        if (String.IsNullOrEmpty(XmlaEndpoint))
+        {
+            var nameEncoded = UrlEncoder.Default.Encode(Name);
+            XmlaEndpoint = $"powerbi://api.powerbi.com/v1.0/myorg/{nameEncoded}";
+
+        }
+        DatasetsFromConfig = Datasets.ToDictionary(d => d.Id);
+
+    }
+
+    internal void LoadDatasetsFromService(string dataSource, string accessToken)
+    {
+        var constr = $"Data Source={dataSource};User Id=;Password={accessToken};";
+        using (var con = new AdomdConnection(constr))
+        {
+            con.Open();
+            var cmd = con.CreateCommand();
+            cmd.CommandText = "select * from $System.DBSCHEMA_CATALOGS";
+            using (var rdr = cmd.ExecuteReader())
+            {
+                int catalogNamePos = rdr.GetOrdinal("CATALOG_NAME");
+                int databaseIdPos = -1;
+                for (int i = 0; i < rdr.FieldCount; i++)
+                {
+                    if (rdr.GetName(i) == "DATABASE_ID")
+                    {
+                        databaseIdPos = i;
+                        break;
+                    }
+                }
+                while (rdr.Read()) 
+                {
+                    var name = rdr.GetString(catalogNamePos);
+                    var id = (databaseIdPos>-1) ? rdr.GetGuid(databaseIdPos) : Guid.Empty;
+
+                    this.DatasetsFromService.Add(id, new Dataset() { Id = id, Name = name });
+                }
+            }
+
+
+        }
+    }
+}
+public class CorkspaceConfiguration
+{
+    public Dictionary<Guid, Workspace> Workspaces { get; set; } = new Dictionary<Guid, Workspace>();
+
+
+    
     
 }
