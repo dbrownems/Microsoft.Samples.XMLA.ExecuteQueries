@@ -1,8 +1,11 @@
 using Microsoft.AnalysisServices.AdomdClient;
 using Microsoft.PowerBI.Api;
 using Microsoft.PowerBI.Api.Models;
+using Microsoft.Samples.XMLA.ExecuteQueries;
+using System.Collections.Concurrent;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Xml.Linq;
 
 var configBuilder = new ConfigurationBuilder()
                .SetBasePath(Directory.GetCurrentDirectory())
@@ -28,7 +31,10 @@ var workspaceLookup = workspaces.ToDictionary(w => w.Id);
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Services.AddSingleton(new ConcurrentDictionary<string, AdomdConnectionPool>());
+builder.Logging.AddConsole();
 var app = builder.Build();
+
 
 app.Urls.Add("https://localhost:3000");
 // Configure the HTTP request pipeline.
@@ -40,18 +46,39 @@ serOpts.WriteIndented = true;
 serOpts.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
 
 string sessionId = null;
-AdomdConnection con = null;
 
 app.MapGet("/HealthProbe", () => "yep");
 
-app.MapPost("/v1.0/myorg/{workspaceId:Guid}/datasets/{datasetId:Guid}/executeQueries", DatasetExecuteQueries);
+app.MapPost("/v1.0/myorg/groups/{workspaceId:Guid}/datasets/{datasetId:Guid}/executeQueries", ExecuteQueriesInGroup);
 
-app.Run();
+var appTask = app.RunAsync();
+
+var log = app.Services.GetService<ILoggerFactory>().CreateLogger("Main");
+var pools = app.Services.GetService<ConcurrentDictionary<string, AdomdConnectionPool>>();
+log.LogInformation("Startup complete");
+while(!appTask.Wait(1000*10))
+{
+    log.LogInformation($"{pools.Count} conection pools");
+    foreach (var (constr, pool) in pools)
+    {
+        log.LogInformation($"Pool for {constr.Substring(0,20)} {pool.SessionCount} sessions");
+    }
+
+}
+log.LogInformation("Shutdown complete");
 
 
-async Task<IResult> DatasetExecuteQueries(Guid workspaceId, Guid datasetId, IConfiguration config, HttpContext context, CancellationToken cancel)
+async Task<IResult> ExecuteQueriesInGroup(Guid workspaceId, 
+                                          Guid datasetId, 
+                                          IConfiguration config, 
+                                          HttpContext context, 
+                                          CancellationToken cancel,
+                                          ILoggerFactory loggerFactory,
+                                          ConcurrentDictionary<string, AdomdConnectionPool> connectionPools
+                                          )
 {
 
+    var log = loggerFactory.CreateLogger("ExecuteQueriesInGroup");
 
     var ms = new MemoryStream();
     await context.Request.BodyReader.CopyToAsync(ms);
@@ -131,26 +158,30 @@ async Task<IResult> DatasetExecuteQueries(Guid workspaceId, Guid datasetId, ICon
         }
     }
 
-
-
+    var pool = connectionPools.GetOrAdd(constr, c => new AdomdConnectionPool(c, log));
+    
     var gzip = false;
     if (context.Request.Headers.AcceptEncoding.Any(e => e.Equals("gzip", StringComparison.OrdinalIgnoreCase)))
     {
         gzip = true;
     }
+    //gzip = true;
 
-
-    if (con == null)
-    {
-        con = new AdomdConnection(constr);
-        con.Open();
-    }
+    var con = pool.GetConnection();
     
     var cmd = con.CreateCommand();
     cmd.CommandText = query;
+   // var doc = XDocument.ReadFrom(cmd.ExecuteXmlReader());
     var reader = cmd.ExecuteReader();
 
-    var result = new DataResult(reader, con, gzip, false, app.Logger);
+    Action<bool> cleanup = success =>
+    {
+        if (!success)
+            con.Dispose();
+
+        pool.ReturnConnection(con);
+    };
+    var result = new DataResult(reader, con, gzip, false, log, cleanup );
     return result;
 
 

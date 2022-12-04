@@ -20,13 +20,13 @@ internal static class Utils
         return name;
     }
 
-    internal static long CopyToBitBucket(this Stream s)
+    internal static async Task<long> CopyToBitBucket(this Stream s)
     {
         long br = 0;
         var buf = new byte[1024];
         while (true)
         {
-            long b = s.Read(buf, 0, buf.Length);
+            long b =  await s.ReadAsync(buf, 0, buf.Length);
             if (b>0)
             {
                 br += b;

@@ -1,4 +1,6 @@
-﻿namespace Microsoft.AnalysisServices.AdomdClient
+﻿using System.Xml.Linq;
+
+namespace Microsoft.AnalysisServices.AdomdClient
 {
     
     public static class AdomdExtensions
@@ -35,28 +37,45 @@
             await cmd.ExecuteJsonToStream(stream, cancel);
         }
 
-        public static string ExecuteJson(this AdomdCommand cmd)
+        static string ExecuteJson(this AdomdCommand cmd)
         {
             using var rdr = cmd.ExecuteReader();
             var ms = new MemoryStream();
-            var encoding = System.Text.Encoding.UTF8;
-            rdr.WriteAsJsonToStream(ms, encoding).Wait();
 
-            return encoding.GetString(ms.ToArray());
+            rdr.WriteAsJsonToStream(ms).Wait();
+
+            return System.Text.Encoding.UTF8.GetString(ms.ToArray());
         }
 
         public static async Task ExecuteJsonToStream(this AdomdCommand cmd, Stream stream, CancellationToken cancel = default(CancellationToken))
         {
             using var rdr = cmd.ExecuteReader();
-            var encoding = System.Text.Encoding.UTF8;
-            await rdr.WriteAsJsonToStream(stream, encoding, cancel);
+            await rdr.WriteAsJsonToStream(stream, cancel);
         }
 
+ 
         public static async Task WriteAsJsonToStream(this AdomdDataReader reader, Stream stream, CancellationToken cancel = default(CancellationToken))
         {
-            await reader.WriteAsJsonToStream(stream, System.Text.Encoding.UTF8, cancel);
+            var debug = false;
+            if (debug)
+            {
+                var ms = new MemoryStream();
+                await WriteAsJsonToStream2(reader, ms, cancel);
+
+                ms.Position = 0;
+                var buf = ms.ToArray();
+                var resp = System.Text.Encoding.UTF8.GetString(buf);
+                ms.Position = 0;
+                await ms.CopyToAsync(stream);
+                
+
+            }
+            else
+            {
+                await WriteAsJsonToStream2(reader, stream, cancel);
+            }
         }
-        public static async Task WriteAsJsonToStream(this AdomdDataReader reader, Stream stream, System.Text.Encoding encoding, CancellationToken cancel = default(CancellationToken))
+        static async Task WriteAsJsonToStream1(AdomdDataReader reader, Stream stream,CancellationToken cancel = default(CancellationToken))
         {
 
             if (reader == null)
@@ -65,6 +84,8 @@
             }
 
             using var rdr = reader;
+
+            var encoding = new System.Text.UTF8Encoding(false);
 
             //can't call Dispose on these without syncronous IO on the underlying connection
             var tw = new StreamWriter(stream, encoding, 1024 * 4, true);
@@ -152,6 +173,118 @@
             }
 
         }
+        static async Task WriteAsJsonToStream2(AdomdDataReader reader, Stream stream, CancellationToken cancel = default(CancellationToken))
+        {
 
+            if (reader == null)
+            {
+                return;
+            }
+
+            using var rdr = reader;
+            var encoding = new System.Text.UTF8Encoding(false);
+            var ms = new MemoryStream();
+            //can't call Dispose on these without syncronous IO on the underlying connection
+            using var tw = new StreamWriter(ms, encoding, 1024 * 4, true);
+            using var w = new Newtonsoft.Json.JsonTextWriter(tw);
+            int rows = 0;
+
+            /*
+                {
+                  "informationProtectionLabel": null,
+                  "results": [
+                    {
+                      "tables": [
+                        {
+                          "rows": [
+                            {
+                              "DimScenario[ScenarioKey]": [],
+                              "DimScenario[ScenarioName]": []
+                            },
+                            {
+                              "DimScenario[ScenarioKey]": [],
+                              "DimScenario[ScenarioName]": []
+                            },
+                            {
+                              "DimScenario[ScenarioKey]": [],
+                              "DimScenario[ScenarioName]": []
+                            }
+                          ],
+                          "error": null
+                        }
+                      ],
+                      "error": null
+                    }
+                  ],
+                  "error": null
+                }
+             * */
+            try
+            {
+
+                w.WriteStartObject();
+                w.WritePropertyName("results");
+                w.WriteStartArray();
+                w.WriteStartObject();
+                w.WritePropertyName("tables");
+                w.WriteStartArray();
+                w.WriteStartObject();
+                w.WritePropertyName("rows");
+                w.WriteStartArray();
+
+
+                int rowsRead = 0;
+                while (rdr.Read())
+                {
+                    if (cancel.IsCancellationRequested)
+                    {
+                        throw new TaskCanceledException();
+                    }
+                    rows++;
+                    w.WriteStartObject();
+                    for (int i = 0; i < rdr.FieldCount; i++)
+                    {
+                        string name = rdr.GetName(i);
+                        object value = rdr.GetValue(i);
+
+                        w.WritePropertyName(name);
+                        w.WriteValue(value);
+                    }
+                    w.WriteEndObject();
+                    rowsRead += 1;
+
+                    if (rowsRead % 100==0)
+                    {
+                        w.Flush();
+                        tw.Flush();
+                        ms.Position = 0;
+                        await ms.CopyToAsync(stream);
+                        ms.SetLength(0);
+                    }
+
+                }
+
+                w.WriteEndArray();
+                w.WriteEndObject();
+                w.WriteEndArray();
+                w.WriteEndObject();
+                w.WriteEndArray();
+                w.WriteEndObject();
+
+                w.Flush();
+                tw.Flush();
+                ms.Position = 0;
+                await ms.CopyToAsync(stream);
+
+            }
+            catch (TaskCanceledException)
+            {
+                throw;
+            }
+
+        }
+
+
+   
     }
 }

@@ -10,9 +10,11 @@ internal class DataResult : IResult, IDisposable
     private bool bufferResults;
     private AdomdConnection con;
     private CancellationToken cancel;
+    private Action<bool> cleanup;
 
-    public DataResult(AdomdDataReader queryResults, AdomdConnection con, bool gzip, bool bufferResults, ILogger log)
+    public DataResult(AdomdDataReader queryResults, AdomdConnection con, bool gzip, bool bufferResults, ILogger log, Action<bool> cleanup = null)
     {
+        this.cleanup = cleanup;
         this.queryResults = queryResults;
         this.log = log;
         this.gzip = gzip;
@@ -68,10 +70,14 @@ internal class DataResult : IResult, IDisposable
             await encodingStream.FlushAsync();
             await responseStream.FlushAsync();
             await context.Response.CompleteAsync();
+            if (cleanup != null)
+                cleanup(true);
 
         }
         catch (Exception ex)
         {
+            if (cleanup != null)
+                cleanup(false);
             log.LogError(ex, "Error writing results");
             con.Dispose(); 
             throw;  //too late to send error to client  
