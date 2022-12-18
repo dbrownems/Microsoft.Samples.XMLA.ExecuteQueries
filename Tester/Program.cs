@@ -5,6 +5,7 @@ using Microsoft.PowerBI.Api.Models;
 using Microsoft.Rest;
 using System.Diagnostics;
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Text.Json;
 
 var sw = new Stopwatch();
@@ -27,106 +28,126 @@ string datasetId = configuration["DatasetId"];
 string accessToken = "al;dfjasofjasoifnkasjnfaslnfjasfnanfoewnwaoefnweioa";
 
 var httpClient = new HttpClient();
+httpClient.BaseAddress = new Uri("https://localhost:3000");
 httpClient.Timeout = TimeSpan.FromMinutes(10);
-
 httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 
 var tokenCredentials = new TokenCredentials(accessToken, "Bearer");
-
-
-//var pbiClient = new PowerBIClient(new Uri("https://api.powerbi.com"), tokenCredentials);
-//var pbiClient = new PowerBIClient(new Uri("https://api.powerbi.com"));
-//pbiClient.Reports.UpdateReportContentInGroup()
-//var r = new UpdateReportContentRequest();
-
-
-
-
-string uri = $"/v1.0/myorg/datasets/{datasetId}/executeQueries";
-
-string xmlaEndpont = "powerbi://api.powerbi.com/v1.0/myorg/ReportExportTesting";
-
-var datasetName = "AdventureWorksCustomerActivityReport";
-//var datasetName = await Utils.GetDatasetName(groupId, datasetId, pbiClient);
-
-httpClient.BaseAddress = new Uri("https://localhost:3000");
-//httpClient.DefaultRequestHeaders.Add("X-Xmla-Endpoint", xmlaEndpont);
-//httpClient.DefaultRequestHeaders.Add("X-Dataset-Name", datasetName);
+var pbiClient = new PowerBIClient(new Uri("https://localhost:3000"), tokenCredentials);
 
 var serOpts = new JsonSerializerOptions();
 serOpts.WriteIndented = true;
 serOpts.MaxDepth = 10;
 serOpts.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
 
-while (true)
-{
-    try
-    {
-        var isAliveReq = await httpClient.GetAsync("/HealthProbe");
-        if (isAliveReq.IsSuccessStatusCode)
-        {
-            break;
-        }
-
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine("Waiting for server startup: " + ex.Message);
-        await Task.Delay(1000);
-    }
-}
+await WaitForServerStartup(httpClient);
 
 Console.WriteLine("Hit any key to stop testing");
 
 while (!Console.KeyAvailable)
-    await RunTest(groupId, datasetId, tokenCredentials);
+    await RunTest(groupId, datasetId, tokenCredentials, clients:20);
 
 Console.WriteLine("Complete");
 
-static async Task SendRequestPBIClient(string groupId, string datasetId, TokenCredentials tokenCredentials, int iterations, string workerName)
+async Task SendRequestPBIClient(string groupId, string datasetId, TokenCredentials tokenCredentials, int iterations, string workerName, bool usePbiClient = false)
 {
     Console.WriteLine($"starting worker {workerName}");
     var sw = new Stopwatch();
-    var pbiClient = new PowerBIClient(new Uri("https://localhost:3000"), tokenCredentials);
 
     var req = new DatasetExecuteQueriesRequest() { Queries = new List<DatasetExecuteQueriesQuery>() };
-    req.Queries.Add(new DatasetExecuteQueriesQuery() { Query = "evaluate topn(100,'Internet Sales')" });
-
+    req.Queries.Add(new DatasetExecuteQueriesQuery() { Query = "evaluate topn(10000,'Internet Sales')" });
+    
     for (int i = 0; i < iterations; i++)
     {
+        if (usePbiClient)
+        {
+
+            sw.Restart();
+
+            Console.WriteLine($"worker {workerName} Sending request");
+
+            try
+            {
+                //var pbiResponse = await pbiClient.Datasets.ExecuteQueriesInGroupWithHttpMessagesAsync(new Guid(groupId), datasetId, req);
+                var pbiResponse = pbiClient.Datasets.ExecuteQueriesInGroupWithHttpMessagesAsync(new Guid(groupId), datasetId, req).Result;
+
+                if (pbiResponse.Response.IsSuccessStatusCode)
+                {
+                    var br = await pbiResponse.Response.Content.ReadAsStream().CopyToBitBucket();
+                    Console.WriteLine($"PowerBIClient API ExecuteQueries returned {br / 1024.0:F2}kb in {sw.Elapsed.TotalSeconds:F2}sec worker {workerName}");
+                }
+                else
+                {
+                    var body = pbiResponse.Response.Content.AsString();
+                    Console.WriteLine($"PowerBIClient API ExecuteQueries failed with {pbiResponse.Response.StatusCode} response {body}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"PowerBIClient API ExecuteQueries failed exception {ex.GetType().Name} response {ex.Message}");
+            }
+        }
+        else
+        {
+            var url = $"/v1.0/myorg/groups/{groupId}/datasets/{datasetId}/executeQueries";
+            try 
+            {
+                var resp = await httpClient.PostAsJsonAsync(url, req, serOpts);
+                if (resp.IsSuccessStatusCode)
+                {
+                    var br = await resp.Content.ReadAsStream().CopyToBitBucket();
+                    Console.WriteLine($"HttpClient API ExecuteQueries returned {br / 1024.0:F2}kb in {sw.Elapsed.TotalSeconds:F2}sec worker {workerName}");
+                }
+                else
+                {
+                    var body = resp.Content.AsString();
+                    Console.WriteLine($"HttpClient API ExecuteQueries failed with {resp.StatusCode} response [{body}]");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"HttpClient API ExecuteQueries failed exception {ex.GetType().Name} response {ex.Message}");
+            }
+            
 
 
-        sw.Restart();
-
-        Console.WriteLine($"worker {workerName} Sending request");
-        var pbiResponse = await pbiClient.Datasets.ExecuteQueriesInGroupWithHttpMessagesAsync(new Guid(groupId), datasetId, req);
-        var br = await pbiResponse.Response.Content.ReadAsStream().CopyToBitBucket();
-
-        Console.WriteLine($"PowerBI API ExecuteQueries returned {br / 1024.0:F2}kb in {sw.Elapsed.TotalSeconds:F2}sec worker {workerName}");
-        //Console.WriteLine(Utils.FormatJson(body));
-
-
-        //sw.Restart(); 
-        //pbiResponse = await pbiClient.Datasets.ExecuteQueriesWithHttpMessagesAsync(datasetId, req);
-        //br = pbiResponse.Response.Content.ReadAsStream().CopyToBitBucket();
-        //Console.WriteLine($"PowerBI API ExecuteQueries returned {br / 1024.0:F2}kb in {sw.Elapsed.TotalSeconds:F2}sec");
-        ////Console.WriteLine(Utils.FormatJson(body2));
-
+        }
     }
     return;
 
 }
 
-static async Task RunTest(string groupId, string datasetId, TokenCredentials tokenCredentials)
+async Task RunTest(string groupId, string datasetId, TokenCredentials tokenCredentials, int clients)
 {
     var tasks = new List<Task>();
-    for (int i = 0; i < 50; i++)
+    for (int i = 0; i < clients; i++)
     {
         Console.WriteLine("Adding worker " + i);
-        tasks.Add(SendRequestPBIClient(groupId, datasetId, tokenCredentials, 10, $"Worker{i:dd}"));
+        tasks.Add(SendRequestPBIClient(groupId, datasetId, tokenCredentials, 10, $"Worker{i:d2}"));
     }
 
     await Task.WhenAll(tasks.ToArray());
+}
+
+static async Task WaitForServerStartup(HttpClient httpClient)
+{
+    while (true)
+    {
+        try
+        {
+            var isAliveReq = await httpClient.GetAsync("/HealthProbe");
+            if (isAliveReq.IsSuccessStatusCode)
+            {
+                break;
+            }
+
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Waiting for server startup: " + ex.Message);
+            await Task.Delay(1000);
+        }
+    }
 }
 
 //var reqBody = new ByteArrayContent(JsonSerializer.SerializeToUtf8Bytes(req, serOpts));

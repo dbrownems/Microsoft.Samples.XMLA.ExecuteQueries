@@ -1,8 +1,11 @@
 using Microsoft.AnalysisServices.AdomdClient;
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.PowerBI.Api;
 using Microsoft.PowerBI.Api.Models;
 using Microsoft.Samples.XMLA.ExecuteQueries;
 using System.Collections.Concurrent;
+using System.Diagnostics.Metrics;
+using System.Net;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Xml.Linq;
@@ -28,13 +31,20 @@ foreach (var workspace in workspaces)
 
 var workspaceLookup = workspaces.ToDictionary(w => w.Id);
 
-
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton(new ConcurrentDictionary<string, AdomdConnectionPool>());
 builder.Logging.AddConsole();
+
 var app = builder.Build();
 
+var process = System.Diagnostics.Process.GetCurrentProcess();
+int requestCount = 0;
+app.Use(async (context, next) =>
+{
+    Interlocked.Increment(ref requestCount);
+    await next(context);
+});
 
 app.Urls.Add("https://localhost:3000");
 // Configure the HTTP request pipeline.
@@ -53,20 +63,24 @@ app.MapPost("/v1.0/myorg/groups/{workspaceId:Guid}/datasets/{datasetId:Guid}/exe
 
 var appTask = app.RunAsync();
 
-var log = app.Services.GetService<ILoggerFactory>().CreateLogger("Main");
+var log = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Main");
+
 var pools = app.Services.GetService<ConcurrentDictionary<string, AdomdConnectionPool>>();
+
 log.LogInformation("Startup complete");
+
 while(!appTask.Wait(1000*10))
 {
-    log.LogInformation($"{pools.Count} conection pools");
+    var cpuTime = process.UserProcessorTime;
+    log.LogInformation($"{pools.Count} conection pools. {requestCount} requests.  {cpuTime:c} CPU time, {requestCount/cpuTime.TotalSeconds} request per CPU Sec.");
     foreach (var (constr, pool) in pools)
     {
-        log.LogInformation($"Pool for {constr.Substring(0,20)} {pool.SessionCount} sessions");
+        
+        log.LogInformation($"Pool for [{pool.RedactedConnectionString}] {pool.PoolStatusString()}");
     }
 
 }
 log.LogInformation("Shutdown complete");
-
 
 async Task<IResult> ExecuteQueriesInGroup(Guid workspaceId, 
                                           Guid datasetId, 
@@ -78,15 +92,16 @@ async Task<IResult> ExecuteQueriesInGroup(Guid workspaceId,
                                           )
 {
 
+
     var log = loggerFactory.CreateLogger("ExecuteQueriesInGroup");
 
-    var ms = new MemoryStream();
-    await context.Request.BodyReader.CopyToAsync(ms);
-    ms.Position = 0;
-    var requestString = System.Text.Encoding.UTF8.GetString(ms.ToArray());
+    //var ms = new MemoryStream();
+    //await context.Request.BodyReader.CopyToAsync(ms);
+    //ms.Position = 0;
+    //var requestString = System.Text.Encoding.UTF8.GetString(ms.ToArray());
 
 
-    var request = JsonSerializer.Deserialize<DatasetExecuteQueriesRequest>(requestString, serOpts);
+    var request = await JsonSerializer.DeserializeAsync<DatasetExecuteQueriesRequest>(context.Request.Body, serOpts);
     //var request = await JsonSerializer.DeserializeAsync<DatasetExecuteQueriesRequest>(context.Request.Body, cancellationToken: cancel);
     if (request == null)
     {
@@ -158,7 +173,10 @@ async Task<IResult> ExecuteQueriesInGroup(Guid workspaceId,
         }
     }
 
+    //constr = constr + "CustomData=" + Random.Shared.Next(1, 10).ToString();
+    //constr = constr + ";Protocol Format=XML";
     var pool = connectionPools.GetOrAdd(constr, c => new AdomdConnectionPool(c, log));
+    
     
     var gzip = false;
     if (context.Request.Headers.AcceptEncoding.Any(e => e.Equals("gzip", StringComparison.OrdinalIgnoreCase)))
@@ -167,24 +185,18 @@ async Task<IResult> ExecuteQueriesInGroup(Guid workspaceId,
     }
     //gzip = true;
 
-    var con = pool.GetConnection();
+    var wrapper = pool.GetWrappedConnection();
+    var con = wrapper.Connection;
+    context.Response.RegisterForDispose(wrapper);
     
+
+
     var cmd = con.CreateCommand();
     cmd.CommandText = query;
-   // var doc = XDocument.ReadFrom(cmd.ExecuteXmlReader());
     var reader = cmd.ExecuteReader();
 
-    Action<bool> cleanup = success =>
-    {
-        if (!success)
-            con.Dispose();
-
-        pool.ReturnConnection(con);
-    };
-    var result = new DataResult(reader, con, gzip, false, log, cleanup );
+    var result = new DataResult(reader, con, gzip, false, log );
     return result;
-
-
     
 }
 
