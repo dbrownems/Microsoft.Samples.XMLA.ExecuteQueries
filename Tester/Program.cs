@@ -23,9 +23,11 @@ string clientSecret = configuration["ClientSecret"];
 string tenantId = configuration["TenantId"];
 string groupId = configuration["GroupId"];
 string datasetId = configuration["DatasetId"];
+string query = configuration["Query"];
+int clients = int.Parse(configuration["ClientCount"]);
+int clientThinkTimeSec = int.Parse(configuration["ClientThinkTimeSec"]);
 
-//string accessToken = await Utils.GetBearerTokenAsync(clientId, clientSecret, tenantId);
-string accessToken = "al;dfjasofjasoifnkasjnfaslnfjasfnanfoewnwaoefnweioa";
+string accessToken = await Utils.GetBearerTokenAsync(clientId, clientSecret, tenantId);
 
 var httpClient = new HttpClient();
 httpClient.BaseAddress = new Uri("https://localhost:3000");
@@ -44,21 +46,41 @@ await WaitForServerStartup(httpClient);
 
 Console.WriteLine("Hit any key to stop testing");
 
+bool shutdown = false;
+
 while (!Console.KeyAvailable)
-    await RunTest(groupId, datasetId, tokenCredentials, clients:20);
+    await RunTest(groupId, datasetId, tokenCredentials, clients:clients, query:query, clientThinkTimeSec:clientThinkTimeSec);
 
+shutdown = true;
 Console.WriteLine("Complete");
+async Task RunTest(string groupId, string datasetId, TokenCredentials tokenCredentials, int clients, string query, int clientThinkTimeSec)
+{
+    var tasks = new List<Task>();
+    for (int i = 0; i < clients; i++)
+    {
+        Console.WriteLine("Adding worker " + i);
+        
+        tasks.Add(SendRequests(groupId, datasetId, tokenCredentials, 10000, $"Worker{i:d2}", query, clientThinkTimeSec, usePbiClient:false));
+    }
 
-async Task SendRequestPBIClient(string groupId, string datasetId, TokenCredentials tokenCredentials, int iterations, string workerName, bool usePbiClient = false)
+    await Task.WhenAll(tasks.ToArray());
+}
+
+async Task SendRequests(string groupId, string datasetId, TokenCredentials tokenCredentials, int iterations, string workerName, string query, int clientThinkTimeSec, bool usePbiClient = false)
 {
     Console.WriteLine($"starting worker {workerName}");
     var sw = new Stopwatch();
 
     var req = new DatasetExecuteQueriesRequest() { Queries = new List<DatasetExecuteQueriesQuery>() };
-    req.Queries.Add(new DatasetExecuteQueriesQuery() { Query = "evaluate topn(10000,'Internet Sales')" });
+    req.Queries.Add(new DatasetExecuteQueriesQuery() { Query = query });
     
     for (int i = 0; i < iterations; i++)
     {
+        if (shutdown)
+            return;
+        
+        await Task.Delay((clientThinkTimeSec/2+Random.Shared.Next(1+clientThinkTimeSec)) * 1000);
+
         if (usePbiClient)
         {
 
@@ -79,7 +101,7 @@ async Task SendRequestPBIClient(string groupId, string datasetId, TokenCredentia
                 else
                 {
                     var body = pbiResponse.Response.Content.AsString();
-                    Console.WriteLine($"PowerBIClient API ExecuteQueries failed with {pbiResponse.Response.StatusCode} response {body}");
+                    Console.WriteLine($"PowerBIClient API ExecuteQueries failed with {(int)pbiResponse.Response.StatusCode}-{pbiResponse.Response.StatusCode} response {body}");
                 }
             }
             catch (Exception ex)
@@ -89,6 +111,8 @@ async Task SendRequestPBIClient(string groupId, string datasetId, TokenCredentia
         }
         else
         {
+            sw.Restart();
+
             var url = $"/v1.0/myorg/groups/{groupId}/datasets/{datasetId}/executeQueries";
             try 
             {
@@ -101,7 +125,7 @@ async Task SendRequestPBIClient(string groupId, string datasetId, TokenCredentia
                 else
                 {
                     var body = resp.Content.AsString();
-                    Console.WriteLine($"HttpClient API ExecuteQueries failed with {resp.StatusCode} response [{body}]");
+                    Console.WriteLine($"HttpClient API ExecuteQueries failed with {(int)resp.StatusCode}-{resp.StatusCode} response [{body}]");
                 }
             }
             catch (Exception ex)
@@ -117,17 +141,6 @@ async Task SendRequestPBIClient(string groupId, string datasetId, TokenCredentia
 
 }
 
-async Task RunTest(string groupId, string datasetId, TokenCredentials tokenCredentials, int clients)
-{
-    var tasks = new List<Task>();
-    for (int i = 0; i < clients; i++)
-    {
-        Console.WriteLine("Adding worker " + i);
-        tasks.Add(SendRequestPBIClient(groupId, datasetId, tokenCredentials, 10, $"Worker{i:d2}"));
-    }
-
-    await Task.WhenAll(tasks.ToArray());
-}
 
 static async Task WaitForServerStartup(HttpClient httpClient)
 {

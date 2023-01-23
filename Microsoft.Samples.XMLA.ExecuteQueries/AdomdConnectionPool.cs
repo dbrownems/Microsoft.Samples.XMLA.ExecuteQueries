@@ -13,7 +13,8 @@
 
         public AdomdConnectionPool Pool => pool;
         public AdomdConnection Connection => con;
-        public WrappedConnection(AdomdConnectionPool pool, AdomdConnection con)        {
+        public WrappedConnection(AdomdConnectionPool pool, AdomdConnection con)
+        {
             this.con = con;
             this.pool = pool;
        }
@@ -188,8 +189,25 @@
                 throw new ArgumentException("AdomdConnection object is null at ReturnConnection");
 
             Interlocked.Increment(ref returnConnectionCount);
-            sessionStats[con.SessionID].ReturnCount++;
 
+            if (con.State != System.Data.ConnectionState.Open)
+            {
+                con.Dispose();
+                return;
+            }
+
+            string sessionId;
+            try
+            {
+                sessionId = con.SessionID;
+            }
+            catch (NullReferenceException)
+            {
+                con.Dispose();
+                return;
+            }
+
+            sessionStats[con.SessionID].ReturnCount++;
             pool.Return(con);
         }
 
